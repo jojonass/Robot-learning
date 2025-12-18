@@ -8,6 +8,8 @@ import gymnasium as gym
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import CheckpointCallback
 from utlitlies import *
+from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.utils import set_random_seed
 
 
 # ==================== DEVICE CONFIGURATION ====================
@@ -41,6 +43,8 @@ class MT10Wrapper(gym.Env):
         self.action_space = dummy_env.action_space
         self.active_env = None
         self.current_task_idx = 0
+
+
 
     def _get_one_hot(self, task_idx):
         one_hot = np.zeros(10, dtype=np.float32)
@@ -83,20 +87,31 @@ class MT10Wrapper(gym.Env):
             self.active_env.close()
 
 
+def make_env(rank, seed=42):
+    def _init():
+        # This keeps your logic identical
+        env = MT10Wrapper()
+        env = gym.wrappers.TimeLimit(env, max_episode_steps=500)
+        return env
+
+    set_random_seed(seed + rank)
+    return _init
+
 if __name__ == "__main__":
 
-
-    TOTAL_TIMESTEPS = 50000  # Increased for better convergence
-    MAX_EPISODE_STEPS = 500  # Maximum steps per episode
-    ALGORITHM = "SAC"
-    env = gym.wrappers.TimeLimit(MT10Wrapper(), max_episode_steps=MAX_EPISODE_STEPS)
-    eval_env = gym.wrappers.TimeLimit(MT10Wrapper(), max_episode_steps=MAX_EPISODE_STEPS)
-    success_callback = SuccessCallback(log_freq=10_000)
+    NUM_ENV = 1
     SEED = 42
+    # Vectorized training env
+    env = SubprocVecEnv([make_env(i, SEED) for i in range(NUM_ENV)])
+    # Single eval env (wrapped in VecEnv for compatibility)
+    eval_env = SubprocVecEnv([make_env(99, SEED)])
+    success_callback = SuccessCallback(log_freq=10000)
+    # --- SETTINGS ---
+    TOTAL_TIMESTEPS = 50000
 
-
+    ALGORITHM = "SAC"
     # Evaluation Settings
-    EVAL_FREQ = 10000  # Evaluate every N steps
+    EVAL_FREQ = 10000 // NUM_ENV # Adjusted for vectorization0  # Evaluate every N steps
     N_EVAL_EPISODES = 20  # Number of episodes for evaluation
     CHECKPOINT_FREQ = 25000  # Save checkpoint every N steps
 
@@ -181,3 +196,5 @@ if __name__ == "__main__":
 
     # Cleanup
     env.close()
+
+    # to check tensorboard: tensorboard --logdir="C:\Users\josef\OneDrive\Desktop\Robot learning folder\Project\metaworld_logs"
