@@ -11,19 +11,27 @@ class SuccessCallback(BaseCallback):
         self.env_current_success = defaultdict(float)
 
     def _on_step(self) -> bool:
-        infos = self.locals.get("infos", [])
-        dones = self.locals.get("dones", [])
+        # SB3 stores current step data in self.locals
+        infos = self.locals.get("infos")
+        dones = self.locals.get("dones")
+
+        # Safety check: skip if data isn't populated yet
+        if infos is None or dones is None:
+            return True
 
         for i, info in enumerate(infos):
             if "task_name" in info and "success" in info:
+                # Track maximum success seen in current episode for this specific env index
                 self.env_current_success[i] = max(self.env_current_success[i], info["success"])
 
         for i, done in enumerate(dones):
             if done:
+                # Episode finished for env 'i'
                 info = infos[i]
                 if "task_name" in info:
                     task = info["task_name"]
                     self.task_successes[task].append(self.env_current_success[i])
+                # Reset tracking for this env index only
                 self.env_current_success[i] = 0.0
 
         if self.num_timesteps % self.log_freq == 0:
@@ -34,16 +42,21 @@ class SuccessCallback(BaseCallback):
         total = []
         for task, successes in self.task_successes.items():
             if successes:
+                # Record rolling average of last 100 episodes for this specific task
                 rate = np.mean(successes[-100:])
                 self.logger.record(f"success/{task}", rate)
                 total.append(rate)
         if total:
+            # Mean across all MT10 tasks
             self.logger.record("success/mean_MT10", np.mean(total))
 
 
 class EvalSuccessCallback(EvalCallback):
     def _on_step(self) -> bool:
+        # Run the standard EvalCallback logic (saves best model, logs reward)
         result = super()._on_step()
+
+        # Only run our custom success logging when an evaluation has actually triggered
         if self.n_calls % self.eval_freq == 0:
             self._run_eval_success()
         return result
@@ -51,34 +64,38 @@ class EvalSuccessCallback(EvalCallback):
     def _run_eval_success(self):
         task_success = defaultdict(list)
         for _ in range(self.n_eval_episodes):
-            obs_result = self.eval_env.reset()
-            obs = obs_result[0] if isinstance(obs_result, tuple) else obs_result
+            # reset() on VecEnv returns only the observation array
+            obs = self.eval_env.reset()
             done = False
+            last_info = {}
 
             while not done:
                 action, _ = self.model.predict(obs, deterministic=True)
-                step_result = self.eval_env.step(action)
+                # VecEnv returns 4 values: obs, rewards, dones, infos
+                obs, reward, done_array, info_array = self.eval_env.step(action)
 
-                if len(step_result) == 5:
-                    obs, reward, terminated, truncated, info = step_result
-                else:
-                    obs, reward, terminated, info = step_result
-                    truncated = False
+                done = done_array[0]
+                info = info_array[0]
+                last_info = info
 
                 if info.get("success", 0) > 0:
                     task_success[info["task_name"]].append(1.0)
+                    done = True  # Force exit while loop
                     break
 
-                done = terminated or truncated
-
-            if not info.get("success", 0) > 0:
-                task_success[info["task_name"]].append(0.0)
+            # If we exited without a success break, record it as a failure
+            if not last_info.get("success", 0) > 0:
+                if "task_name" in last_info:
+                    task_success[last_info["task_name"]].append(0.0)
 
         means = []
         for task, values in task_success.items():
             mean = np.mean(values)
             self.logger.record(f"eval_success/{task}", mean)
             means.append(mean)
+
         if means:
             self.logger.record("eval_success/mean_MT10", np.mean(means))
+
+        # Force writing to TensorBoard immediately
         self.logger.dump(self.num_timesteps)
