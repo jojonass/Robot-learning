@@ -1,226 +1,144 @@
 import os
-if 'MUJOCO_GL' in os.environ:
-    os.environ.pop('MUJOCO_GL', None)
-import warnings
-import gymnasium as gym
-import metaworld
-import numpy as np
+os.environ["MUJOCO_GL"] = "egl"
 import torch
-from stable_baselines3 import TD3, DDPG, SAC
-from stable_baselines3.common.noise import NormalActionNoise
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, BaseCallback, StopTrainingOnRewardThreshold
-from stable_baselines3.common.monitor import Monitor
+import metaworld
+import random
+import numpy as np
+import gymnasium as gym
+from stable_baselines3 import SAC
+from stable_baselines3.common.callbacks import CheckpointCallback
+from utlitlies import *
 from stable_baselines3.common.vec_env import SubprocVecEnv
-import warnings
-
-os.environ['MUJOCO_GL'] = 'glfw'
-os.environ['GYM_WARN'] = '0'
+from stable_baselines3.common.utils import set_random_seed
 
 
-# ==================== DEVICE CONFIGURATION ====================
-print("=" * 60)
-if torch.cuda.is_available():
-    TARGET_DEVICE = "cuda"
-    #print(f" CUDA available! Training will run on: {torch.cuda.get_device_name(0)}")
-else:
-    TARGET_DEVICE = "cpu"
-    #warnings.warn(" CUDA not available. Training will default to CPU.", UserWarning)
-print("=" * 60)
+# ==================== SETTINGS ==================== 
+TASK_NAME = 'reach-v3'   # 'reach-v3', 'push-v3', 'pick-place-v3'
+SEED = 1 # 1,2,3,4,5,6,7,8,8,10 seeds to check randomization of start 
+NUM_ENV = 8
+TOTAL_TIMESTEPS = 500_000
 
-
-def make_env(task_name='reach-v3', rank=0, seed=0, max_episode_steps=500, normalize_reward=False):
-    """
-    Create and wrap the Meta-World MT1 environment.
-    Args:
-        task_name: Name of the Meta-World task (e.g., 'reach-v3', 'push-v3')
-        rank: Index of the subprocess (for parallel envs)
-        seed: Random seed
-        max_episode_steps: Maximum steps per episode (default: 500)
-        normalize_reward: Whether to normalize rewards (optional, can improve learning)
-    """
+def make_env(rank, seed=42):
     def _init():
-        env = gym.make(
-            'Meta-World/MT1',
-            env_name=task_name,
-            seed=seed + rank,  # Different seed for each parallel env
-            reward_function_version='v3',
-            max_episode_steps=max_episode_steps,  # Episode length
-            terminate_on_success=False,  # Don't terminate early on success (for training)
-        )
+        mt1 = metaworld.MT1(TASK_NAME)
+        env = mt1.train_classes[TASK_NAME]()
+        specific_task = mt1.train_tasks[0]
+        task_list = mt1.train_tasks
+        specific_task = task_list[rank % len(task_list)]
+        env.set_task(specific_task)
+        env = gym.wrappers.RecordEpisodeStatistics(env) 
+        env = gym.wrappers.TimeLimit(env, max_episode_steps=500)
+    
+        class SuccessFixer(gym.Wrapper):
+            def step(self, action):
+                obs, reward, terminated, truncated, info = self.env.step(action)
+                info["task_name"] = TASK_NAME 
+                return obs, reward, terminated, truncated, info
 
-        # Optional: Normalize rewards for more stable learning
-        # Uncomment if experiencing training instability
-        # if normalize_reward:
-        #     env = gym.wrappers.NormalizeReward(env)
 
-        # Monitor wrapper for logging episode statistics
-        # This automatically tracks episode rewards, lengths, and success rates
-        env = Monitor(env)
-
-        return env
-
+        set_random_seed(seed + rank)
+        return SuccessFixer(env)
+        
     return _init
 
-
 if __name__ == "__main__":
-    # ==================== CONFIGURATION ====================
-    # Task Selection
-    TASK_NAME = "reach-v3"  # Change to other MT1 tasks like "push-v3", "pick-place-v3", etc.
+    
 
-    # Algorithm Selection
-    ALGORITHM = "SAC"  # "TD3" or "DDPG" - SAC recommended for Meta-World
+    slurm_task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+    if slurm_task_id:
+        SEED = int(slurm_task_id)
+        print(f"Running on Cluster: Slurm Array Task ID {SEED} detected.")
+    else:
+        SEED = 1
+        print("Running Locally: Defaulting to SEED 1.")
+                
+    if torch.cuda.is_available():
+        TARGET_DEVICE = "cuda"
+        print(f" CUDA available! Training will run on: {torch.cuda.get_device_name(0)}")
+    else:
+        TARGET_DEVICE = "cpu"
+        print(" CUDA not available. Training will default to CPU.")
+    print("=" * 60)
+    
+    # 1. Setup Environments
+    env = SubprocVecEnv([make_env(i, SEED) for i in range(NUM_ENV)])
+    eval_env = SubprocVecEnv([make_env(99, SEED)])
 
-    # Environment Settings
-    USE_PARALLEL = True  # Set to False for single environment
-    N_ENVS = 8 if USE_PARALLEL else 1
-    SEED = 42
-
-    # Training Settings
-    TOTAL_TIMESTEPS = 50000  # Increased for better convergence
-    MAX_EPISODE_STEPS = 500  # Maximum steps per episode
-    NORMALIZE_REWARD = False  # Set to True if experiencing training instability
-
-    # Evaluation Settings
-    EVAL_FREQ = 10000  # Evaluate every N steps
-    N_EVAL_EPISODES = 20  # Number of episodes for evaluation
-    CHECKPOINT_FREQ = 25000  # Save checkpoint every N steps
-    # ======================================================
-
-    # Create output directories
+    BASE_LOG_DIR = "./metaworld_logs/MT1"
+    RUN_NAME = f"{TASK_NAME}_seed{SEED}"
+    os.makedirs(BASE_LOG_DIR, exist_ok=True)
     os.makedirs("./metaworld_models", exist_ok=True)
-    os.makedirs("./metaworld_logs", exist_ok=True)
+    
 
-    print(f"=" * 60)
-    print(f"Meta-World MT1 Training: {TASK_NAME}")
-    print(f"Algorithm: {ALGORITHM}")
-    print(f"=" * 60)
+   
+    # 2. Initialize SAC with TARGET_DEVICE
+    model = SAC(
+    policy="MlpPolicy",
+    env=env,
+    learning_rate=3e-4,           # Reduced from 3e-4 to prevent policy collapse
+    buffer_size=1_000_000,
+    learning_starts=10000,        # Early start is fine for simple Reach
+    batch_size=256,               # Higher batch size for smoother gradient updates
+    tau=0.005,
+    gamma=0.99,
+    train_freq=1,
+    gradient_steps=2,             # Set to 1 for MT1 to avoid over-optimizing on noise
+    ent_coef='auto_1.0',          # Standard starting entropy
+    target_entropy=-4.0,          # The standard for 4-dim action space
+    policy_kwargs=dict(
+        net_arch=[256, 256],      # Smaller net is actually MORE stable for Reach MT1
+        activation_fn=torch.nn.ReLU 
+    ),
+    tensorboard_log=BASE_LOG_DIR,
+    verbose=1,
+    seed=SEED,
+    device=TARGET_DEVICE 
+)
+    
 
-    # Create vectorized training environments (parallel)
-    if USE_PARALLEL:
-        print(f"Creating {N_ENVS} parallel training environments...")
-        env = SubprocVecEnv(
-            [make_env(TASK_NAME, i, SEED, MAX_EPISODE_STEPS, NORMALIZE_REWARD) for i in range(N_ENVS)],
-            start_method='spawn'
-        )
-    else:
-        print("Creating single training environment...")
-        env = make_env(TASK_NAME, 0, SEED, MAX_EPISODE_STEPS, NORMALIZE_REWARD)()
-
-    # Create evaluation environment (without reward normalization for accurate eval)
-    print("Creating evaluation environment...")
-    eval_env = make_env(TASK_NAME, 0, SEED + 1000, MAX_EPISODE_STEPS, normalize_reward=False)()
-
-    # Get action space dimensions
-    n_actions = env.action_space.shape[0]
-
-    # Initialize the RL algorithm
-    print(f"\nInitializing {ALGORITHM} agent...")
-
-
-
-    if ALGORITHM == "SAC":
-        # SAC - Recommended for Meta-World (better exploration)
-        model = SAC(
-            policy="MlpPolicy",
-            env=env,
-            learning_rate=3e-4,
-            buffer_size=100_000,
-            learning_starts=5000,  # Start training sooner
-            batch_size=256,
-            tau=0.005,
-            gamma=0.99,  # Higher gamma for multi-step tasks
-            train_freq=1,
-            gradient_steps=-1,  # Train on all available data
-            ent_coef='auto',  # Automatic entropy tuning - crucial for SAC
-            target_entropy='auto',  # Automatically set target entropy
-            use_sde=False,  # State-dependent exploration (can be enabled for more exploration)
-            policy_kwargs=dict(
-                net_arch=[256, 256, 256],  # Deeper network
-                activation_fn=torch.nn.ReLU,
-                log_std_init=-3,  # Initial exploration level
-            ),
-            tensorboard_log=f"./metaworld_logs/{ALGORITHM}/",
-            verbose=1,
-            device="auto",
-            seed=SEED,
-        )
-    else:
-        raise ValueError(f"Unknown algorithm: {ALGORITHM}")
-
-    # Callbacks
-    # Save checkpoint every CHECKPOINT_FREQ steps
+    # 3. Callbacks
     checkpoint_callback = CheckpointCallback(
-        save_freq=CHECKPOINT_FREQ,
+        save_freq=25000,
         save_path=f"./metaworld_models/checkpoints_{TASK_NAME}/",
-        name_prefix=f"{ALGORITHM.lower()}_{TASK_NAME}",
-        verbose=1
+        name_prefix=f"sac_{TASK_NAME}"
     )
 
-    # Evaluate every EVAL_FREQ steps
-    eval_callback = EvalCallback(
+    eval_callback = EvalSuccessCallback(
         eval_env,
-        best_model_save_path=f"./metaworld_models/best_{TASK_NAME}/",
-        log_path=f"./metaworld_logs/eval_{TASK_NAME}/",
-        eval_freq=EVAL_FREQ,
-        n_eval_episodes=N_EVAL_EPISODES,  # More episodes for robust evaluation
-        deterministic=True,
-        render=False,
-        verbose=1,
-        warn=False
+        best_model_save_path= f"./metaworld_models/{RUN_NAME}/best_model/",
+        log_path= f"{BASE_LOG_DIR}/{RUN_NAME}/eval/",
+        eval_freq=10000 // NUM_ENV,
+        n_eval_episodes=50,
+        deterministic=True
     )
 
-    # Train the agent
-    total_timesteps = TOTAL_TIMESTEPS
-    print(f"\nStarting training for {total_timesteps:,} timesteps...")
-    print("=" * 60)
-    print("Training configuration:")
-    print(f"  - Task: {TASK_NAME}")
-    print(f"  - Algorithm: {ALGORITHM}")
-    print(f"  - Parallel environments: {N_ENVS}")
-    print(f"  - Learning rate: {model.learning_rate}")
-    print(f"  - Batch size: {model.batch_size}")
-    print(f"  - Gamma: {model.gamma}")
-    print(f"  - Learning starts: {model.learning_starts}")
-    print(f"  - Buffer size: {model.buffer_size:,}")
-    print(f"  - Network architecture: [256, 256, 256]")
-    print(f"  - Gradient steps: -1 (train on all data)")
-    print(f"  - Seed: {SEED}")
-    print(f"  - Max episode steps: {MAX_EPISODE_STEPS}")
-    print(f"  - Reward function: v2 (more stable)")
-    print(f"  - Normalize reward: {NORMALIZE_REWARD}")
-    print(f"  - Eval frequency: {EVAL_FREQ} steps")
-    print(f"  - Eval episodes: {N_EVAL_EPISODES}")
-    print(f"  - Checkpoint frequency: {CHECKPOINT_FREQ} steps")
-    if ALGORITHM == "TD3":
-        print(f"  - Exploration noise: σ=0.1")
-        print(f"  - Target policy noise: 0.1 (clip: 0.3)")
-    elif ALGORITHM == "SAC":
-        print(f"  - Entropy tuning: Automatic")
-        print(f"  - Target entropy: Automatic")
-    print("=" * 60)
-
+    # 4. Start Learning
+    print(f"Starting MT1 training for task: {TASK_NAME}")
     model.learn(
-        total_timesteps=total_timesteps,
+        total_timesteps=TOTAL_TIMESTEPS,
         callback=[checkpoint_callback, eval_callback],
-        log_interval=10,
-        progress_bar=True
+        tb_log_name=RUN_NAME
     )
 
-    # Save the final model
-    print("\nSaving final model...")
-    model.save(f"./metaworld_models/{ALGORITHM.lower()}_{TASK_NAME}_final")
-
-    print("\n" + "=" * 60)
-    print("Training complete!")
-    print(f"Final model saved to: ./metaworld_models/{ALGORITHM.lower()}_{TASK_NAME}_final.zip")
-    print(f"Best model saved to: ./metaworld_models/best_{TASK_NAME}/best_model.zip")
-    print(f"Checkpoints saved to: ./metaworld_models/checkpoints_{TASK_NAME}/")
-    print(f"\nTo monitor training, run: tensorboard --logdir=./metaworld_logs/")
-    print("=" * 60)
-
-    # Cleanup
+    model.save(f"./metaworld_models/{RUN_NAME}_final")
     env.close()
-    eval_env.close()
+    print("Training Complete.")
 
 
-    #  to find training curves run tensorboard --logdir=./metaworld_logs/ in terminal
+        # Locally run not on slurm
+
+    # to check tensorboard: tensorboard --logdir="C:\Users\josef\OneDrive\Desktop\Robot learning folder\Project\metaworld_logs"
+
+
+########## For cluster  
+
+
+ # run this locally 
+
+#  ssh -L 6006:slurm-head-4:6006 e12434694@cluster.datalab.tuwien.ac.at
+
+
+# for slurm, run this on slurm  Need to activate environment first. # micromamba activate robotlearning
+ # python3 -m tensorboard.main --logdir="/home/e12434694/Robotlearning/Project/metaworld_logs/MT1" --port 6006 --bind_all
+
+ # then this http://localhost:6006 
