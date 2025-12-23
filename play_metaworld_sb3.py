@@ -1,118 +1,138 @@
-"""
-Meta-World MT1 Evaluation Script with Stable Baselines3
-
-Updated to align with the latest Meta-World API.
-Loads trained models and evaluates them with visual rendering.
-
-Usage:
-    1. Set TASK_NAME to match your trained task (e.g., 'reach-v3', 'pick-place-v3')
-    2. Set ALGORITHM to match the trained algorithm ('TD3' or 'SAC')
-    3. Run: python play_metaworld_sb3.py
-"""
-
 import os
 import gymnasium as gym
+from gymnasium.wrappers import RecordVideo
 import metaworld
 import numpy as np
-from stable_baselines3 import TD3, SAC, DDPG
+from stable_baselines3 import SAC
 
+# ==========================================
+# 1. DYNAMIC OBSERVATION WRAPPER
+# ==========================================
+class DynamicMTWrapper(gym.ObservationWrapper):
+    def __init__(self, env, task_index, total_tasks):
+        super().__init__(env)
+        self.task_index = task_index
+        self.total_tasks = total_tasks 
+        obs_shape = 39 + self.total_tasks
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_shape,), dtype=np.float32
+        )
 
-if __name__ == "__main__":
-    # Configuration
-    TASK_NAME = "reach-v3"  # Must match the task used for training (v3, not v2!)
-    ALGORITHM = "SAC"  # "TD3" or "SAC" - must match training algorithm
+    def observation(self, obs):
+        if self.total_tasks == 0: return obs.astype(np.float32)
+        one_hot = np.zeros(self.total_tasks, dtype=np.float32)
+        one_hot[self.task_index] = 1.0
+        return np.concatenate([obs, one_hot]).astype(np.float32)
+
+    def set_task(self, task):
+        return self.env.set_task(task)
+
+    @property
+    def _freeze_rand_vec(self):
+        return self.env._freeze_rand_vec
+
+    @_freeze_rand_vec.setter
+    def _freeze_rand_vec(self, value):
+        self.env._freeze_rand_vec = value
+
+# ==========================================
+# 2. CAMERA FIX WRAPPER (Universal Version)
+# ==========================================
+class MetaWorldCameraWrapper(gym.Wrapper):
+    def __init__(self, env, camera_name="topview"):
+        super().__init__(env)
+        self.camera_name = camera_name
+        
+        # Mapping common names to MuJoCo IDs if the name lookup fails
+        self.cam_map = {
+            'topview': 0,
+            'corner': 1,
+            'corner2': 2,
+            'corner3': 3,
+            'behindview': 4
+        }
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        # Set the name at the unwrapped level
+        self.env.unwrapped.camera_name = self.camera_name
+        return obs, info
+
+    def render(self):
+        # We reach into the low-level MuJoCo renderer
+        # This forces the 'offscreen' camera used for recording
+        if hasattr(self.env.unwrapped, 'mujoco_renderer'):
+            renderer = self.env.unwrapped.mujoco_renderer
+            # Force the camera ID into the renderer's config
+            cam_id = self.cam_map.get(self.camera_name, 0)
+            renderer.camera_id = cam_id
+            renderer.camera_name = self.camera_name
+            
+        return self.env.render()
+
+    def set_task(self, task):
+        return self.env.set_task(task)
+
+    @property
+    def _freeze_rand_vec(self):
+        return self.env._freeze_rand_vec
+
+    @_freeze_rand_vec.setter
+    def _freeze_rand_vec(self, value):
+        self.env._freeze_rand_vec = value
+
+# ==========================================
+# 3. MAIN EVALUATION FUNCTION
+# ==========================================
+def run_evaluation():
+    MODE = "MT10" 
+    CHOSEN_CAMERA = "topview" # Options: 'topview', 'corner2', 'behindview'
+    
+    MT3_TASKS = ['reach-v3', 'push-v3', 'pick-place-v3']
+    BASE_PATH = "/home/e12434694/Robotlearning/Project/metaworld_models"
+    VIDEO_DIR = "./eval_videos"
     SEED = 42
-    MAX_EPISODE_STEPS = 500  # Must match training configuration
 
-    # Create environment with rendering
-    print(f"Creating {TASK_NAME} environment...")
-    env = gym.make(
-        'Meta-World/MT1',
-        env_name=TASK_NAME,
-        seed=SEED,
-        render_mode='human',  # Enable visual rendering
-        reward_function_version='v3',  # Use v2 reward (same as training)
-        max_episode_steps=MAX_EPISODE_STEPS,  # Episode length
-        terminate_on_success=False,  # Don't terminate early (for consistent evaluation)
-    )
+    benchmark = metaworld.MT10(seed=SEED)
+    num_one_hot = 10
+    model_folder = "best_MT10"
 
-    # Load the trained model
-    model_path = f"./metaworld_models/best_{TASK_NAME}/best_model.zip"
+    model_path = os.path.join(BASE_PATH, model_folder, "best_model.zip")
+    print(f"🚀 Loading {MODE} model. Target Camera: {CHOSEN_CAMERA}")
 
-    if not os.path.exists(model_path):
-        print(f"Model not found at {model_path}")
-        print("Trying final model instead...")
-        model_path = f"./metaworld_models/{ALGORITHM.lower()}_{TASK_NAME}_final.zip"
+    for i, (name, env_cls) in enumerate(benchmark.train_classes.items()):
+        # Initialize
+        raw_env = env_cls(render_mode='rgb_array')
+        
+        # Stack Wrappers
+        mt_env = DynamicMTWrapper(raw_env, task_index=i, total_tasks=10)
+        cam_env = MetaWorldCameraWrapper(mt_env, camera_name="corner")   
+        
+        # Set Task
+        task_config = [t for t in benchmark.train_tasks if t.env_name == name][0]
+        cam_env.set_task(task_config)
 
-        if not os.path.exists(model_path):
-            print(f"No trained model found!")
-            print(f"Please train the model first using train_metaworld_sb3.py")
-            exit(1)
+        # Record Video
+        env = RecordVideo(
+            cam_env, 
+            video_folder=os.path.join(VIDEO_DIR, name),
+            episode_trigger=lambda x: x == 0,
+            name_prefix=f"eval_fixed"
+        )
 
-    print(f"Loading model from: {model_path}")
-    if ALGORITHM == "DDPG":
-        model = DDPG.load(model_path, env=env)
-    elif ALGORITHM == "TD3":
-        model = TD3.load(model_path, env=env)
-    elif ALGORITHM == "SAC":
-        model = SAC.load(model_path, env=env)
-    else:
-        raise ValueError(f"Unknown algorithm: {ALGORITHM}")
+        if i == 0:
+            model = SAC.load(model_path, env=env)
 
-    # Run evaluation episodes
-    num_episodes = 10
-    total_rewards = []
-    success_count = 0
-
-    print(f"\nRunning {num_episodes} evaluation episodes...")
-    print("=" * 60)
-
-    for episode in range(num_episodes):
-        obs, info = env.reset()
-        done = False
-        truncated = False
-        total_reward = 0
-        steps = 0
-        episode_success = False
-
-        print(f"\n--- Episode {episode + 1}/{num_episodes} ---")
-
-        while not (done or truncated):
-            # Get action from policy (deterministic for evaluation)
-            action, _states = model.predict(obs, deterministic=True)
-
-            # Step environment
+        # Execution
+        obs, _ = env.reset()
+        for _ in range(500): # Run one full episode (max_path_length is usually 500)
+            action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, truncated, info = env.step(action)
-
-            total_reward += reward
-            steps += 1
-
-            # Check for success (Meta-World provides success info)
-            if 'success' in info and info['success']:
-                episode_success = True
-
-            # Render
-            env.render()
-
-        print(f"Episode finished after {steps} steps")
-        print(f"Total reward: {total_reward:.2f}")
-        print(f"Success: {episode_success}")
-
-        total_rewards.append(total_reward)
-        if episode_success:
-            success_count += 1
-
-    # Print summary statistics
-    print("\n" + "=" * 60)
-    print("=== Evaluation Complete ===")
-    print(f"Task: {TASK_NAME}")
-    print(f"Episodes: {num_episodes}")
-    print(f"Average reward: {np.mean(total_rewards):.2f}")
-    print(f"Std reward: {np.std(total_rewards):.2f}")
-    print(f"Min reward: {np.min(total_rewards):.2f}")
-    print(f"Max reward: {np.max(total_rewards):.2f}")
-    print(f"Success rate: {success_count}/{num_episodes} ({100*success_count/num_episodes:.1f}%)")
-    print("=" * 60)
-
-    # Cleanup
-    env.close()
+            if done or truncated:
+                break
+        
+        print(f"Finished recording: {name}")
+        env.close()
+        
+if __name__ == "__main__":
+    run_evaluation()
