@@ -1,5 +1,5 @@
 import os
-os.environ["MUJOCO_GL"] = "glfw"
+os.environ["MUJOCO_GL"] = "egl"
 import torch
 import metaworld
 import random
@@ -99,7 +99,7 @@ def make_env(rank, seed=42):
 
 if __name__ == "__main__":
 
-    NUM_ENV = 1
+    NUM_ENV = 40
     SEED = 42
     # Vectorized training env
     env = SubprocVecEnv([make_env(i, SEED) for i in range(NUM_ENV)])
@@ -107,7 +107,7 @@ if __name__ == "__main__":
     eval_env = SubprocVecEnv([make_env(99, SEED)])
     success_callback = SuccessCallback(log_freq=10000)
     # --- SETTINGS ---
-    TOTAL_TIMESTEPS = 50000
+    TOTAL_TIMESTEPS = 5_000_000
 
     ALGORITHM = "SAC"
     # Evaluation Settings
@@ -115,41 +115,44 @@ if __name__ == "__main__":
     N_EVAL_EPISODES = 20  # Number of episodes for evaluation
     CHECKPOINT_FREQ = 25000  # Save checkpoint every N steps
 
+
+
     # Create output directories
+    BASE_LOG_DIR = "./metaworld_logs/MT10"
+    RUN_NAME = f"seed{SEED}"  # Simplified for flat structure
+    
+    os.makedirs(BASE_LOG_DIR, exist_ok=True)
     os.makedirs("./metaworld_models", exist_ok=True)
-    os.makedirs("./metaworld_logs", exist_ok=True)
 
     print(f"=" * 60)
     print("Meta-World MT10 Training")
     print(f"=" * 60)
 
 
-
-    # SAC - Recommended for Meta-World (better exploration)
+    RUN_NAME = f"MT10_seed{SEED}"
+    # SAC - Recommended for Meta-World (better exploration)#
     model = SAC(
         policy="MlpPolicy",
         env=env,
         learning_rate=3e-4,
-        buffer_size=100_000,
-        learning_starts=5000,  # Start training sooner
-        batch_size=256,
+        buffer_size=2_000_000,
+        learning_starts=10000, 
+        batch_size=512,         # Increased batch size for more stable MT10 updates
         tau=0.005,
-        gamma=0.99,  # Higher gamma for multi-step tasks
+        gamma=0.99,
         train_freq=1,
-        gradient_steps=-1,  # Train on all available data
-        ent_coef='auto',  # Automatic entropy tuning - crucial for SAC
-        target_entropy='auto',  # Automatically set target entropy
-        use_sde=False,  # State-dependent exploration (can be enabled for more exploration)
+        gradient_steps=NUM_ENV,     # Increased for faster learning
+        ent_coef='auto',
         policy_kwargs=dict(
-            net_arch=[256, 256, 256],  # Deeper network
+            net_arch=[512, 512, 512], # Increased capacity for 10 tasks
             activation_fn=torch.nn.ReLU,
-            log_std_init=-3,  # Initial exploration level
         ),
-            tensorboard_log="./metaworld_logs/MT10/",
-            verbose=1,
-            device="auto",
-            seed=SEED,
-        )
+        tensorboard_log=BASE_LOG_DIR,
+        verbose=1,
+        device="auto",
+        seed=SEED,
+    )
+   
 
     # Save checkpoint every CHECKPOINT_FREQ steps
     checkpoint_callback = CheckpointCallback(
@@ -162,8 +165,8 @@ if __name__ == "__main__":
     # Evaluate every EVAL_FREQ steps
     eval_callback =  EvalSuccessCallback(
         eval_env,
-        best_model_save_path=f"./metaworld_models/best_MT10/",
-        log_path=f"./metaworld_logs/eval_MT10/",
+        best_model_save_path= f"./metaworld_models/{RUN_NAME}/best_model/",
+        log_path= f"{BASE_LOG_DIR}/{RUN_NAME}/eval/",
         eval_freq=EVAL_FREQ,
         n_eval_episodes=N_EVAL_EPISODES,  # More episodes for robust evaluation
         deterministic=True,
@@ -178,7 +181,8 @@ if __name__ == "__main__":
         total_timesteps=TOTAL_TIMESTEPS,
         callback=[checkpoint_callback, eval_callback,success_callback],
         log_interval=10,
-        progress_bar=True
+        progress_bar=True,
+        tb_log_name=RUN_NAME
     )
     print("MT10 Task-Conditioned Wrapper learn success.")
 
@@ -197,4 +201,21 @@ if __name__ == "__main__":
     # Cleanup
     env.close()
 
+    # Locally run not on slurm
+
     # to check tensorboard: tensorboard --logdir="C:\Users\josef\OneDrive\Desktop\Robot learning folder\Project\metaworld_logs"
+
+
+########## For cluster  
+
+
+ # run this locally 
+
+#  ssh -L 6006:slurm-head-4:6006 e12434694@cluster.datalab.tuwien.ac.at
+
+
+# for slurm, run this on slurm  Need to activate environment first. # micromamba activate robotlearning
+ # python3 -m tensorboard.main --logdir="/home/e12434694/Robotlearning/Project/metaworld_logs/MT10" --port 6006 --bind_all
+
+
+ # then this http://localhost:6006 
