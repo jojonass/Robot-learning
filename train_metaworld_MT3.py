@@ -7,9 +7,10 @@ import numpy as np
 import gymnasium as gym
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import CheckpointCallback
-from utlitlies import *
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from utlitlies import * # Ensure this contains SuccessCallback and EvalSuccessCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.utils import set_random_seed
+import argparse
 
 # ==================== DEVICE CONFIGURATION ====================
 print("=" * 60)
@@ -24,11 +25,11 @@ print("=" * 60)
 class MT3Wrapper(gym.Env):
     def __init__(self):
         super().__init__()
-        self.benchmark = metaworld.MT50() # Best for pulling specific v3 tasks
+        self.benchmark = metaworld.MT50() 
         self.task_names = ['reach-v3', 'push-v3', 'pick-place-v3']
         self.all_tasks = [t for t in self.benchmark.train_tasks if t.env_name in self.task_names]
 
-        # Define spaces: 39 (Base) + 3 (One-Hot for MT3)
+        # Define spaces: 39 (Base) + 3 (One-Hot)
         dummy_env = self.benchmark.train_classes[self.task_names[0]]()
         obs_shape = dummy_env.observation_space.shape[0] + len(self.task_names)
 
@@ -52,7 +53,7 @@ class MT3Wrapper(gym.Env):
         if self.active_env is None or self.active_env.__class__ != env_cls:
             self.active_env = env_cls()
             
-        self.active_env._freeze_rand_vec = False  # Goal randomization
+        self.active_env._freeze_rand_vec = False 
         self.active_env.set_task(task)
 
         raw_obs = self.active_env.reset(seed=seed)
@@ -64,15 +65,25 @@ class MT3Wrapper(gym.Env):
     def step(self, action):
         raw_obs, reward, terminated, truncated, info = self.active_env.step(action)
         full_obs = np.concatenate([raw_obs, self._get_one_hot(self.current_task_idx)])
-        info["task_name"] = self.task_names[self.current_task_idx]
+        
+        task_name = self.task_names[self.current_task_idx]
+        info["task_name"] = task_name
+        is_success = info.get("success", 0) > 0
+        
+        if is_success:
+            if "reach" in task_name:
+                reward += 2.0
+            elif "push" in task_name:
+                reward += 200.0
+            elif "pick-place" in task_name:
+                reward += 5000.0 
+    
+        reward = np.log1p(reward)
         return full_obs.astype(np.float32), reward, terminated, truncated, info
 
-    def render(self):
-        return self.active_env.render()
-
+    def render(self): return self.active_env.render()
     def close(self):
-        if self.active_env is not None:
-            self.active_env.close()
+        if self.active_env is not None: self.active_env.close()
 
 def make_env(rank, seed=42):
     def _init():
@@ -81,69 +92,72 @@ def make_env(rank, seed=42):
         return env
     set_random_seed(seed + rank)
     return _init
+    
+def linear_schedule(initial_value: float):
+    def func(progress_remaining: float) -> float:
+        return progress_remaining * initial_value
+    return func # FIXED: was returning 'function'
 
 if __name__ == "__main__":
-    # --- SETTINGS ---
+    # --- SEED HANDLING ---
+    slurm_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+    SEED = int(slurm_id) if slurm_id else 42
+    RUN_NAME = f"MT3_seed{SEED}"
+
+    # --- HYPERPARAMETERS ---
     NUM_ENV = 24
-    SEED = 42
-    TOTAL_TIMESTEPS = 1_000_000
+    TOTAL_TIMESTEPS = 5_000_000
     ALGORITHM = "SAC"
     EVAL_FREQ = 20000 // NUM_ENV
-    N_EVAL_EPISODES = 15 # 5 episodes per task
+    N_EVAL_EPISODES = 15 
     CHECKPOINT_FREQ = 50000
-
-    # Create output directories
-
     BASE_LOG_DIR = "./metaworld_logs/MT3"
-    RUN_NAME = f"seed{SEED}"  # Simplified for a cleaner folder name
-    
+
     os.makedirs(BASE_LOG_DIR, exist_ok=True)
     os.makedirs("./metaworld_models", exist_ok=True)
 
-    # Setup Environments
+    # --- ENV SETUP ---
+    # Added VecNormalize for better stability across tasks
     env = SubprocVecEnv([make_env(i, SEED) for i in range(NUM_ENV)])
+    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)
+    
     eval_env = SubprocVecEnv([make_env(99, SEED)])
+    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10., training=False)
+
     success_callback = SuccessCallback(log_freq=10000)
 
-    print(f"=" * 60)
-    print("Meta-World MT3 Training")
-    print(f"=" * 60)
-
-    RUN_NAME = f"MT3_seed{SEED}"
-
     model = SAC(
-    policy="MlpPolicy",
-    env=env,
-    learning_rate=3e-4,            
-    buffer_size=1_000_000,         
-    learning_starts=20000,        
-    batch_size=512,               
-    tau=0.005,
-    gamma=0.99,                    
-    train_freq=1,
-    gradient_steps=NUM_ENV,        
-    sde_sample_freq=64,            
-    ent_coef='auto_1.0',          
-    target_entropy=-4.0,           
-    policy_kwargs=dict(
-        net_arch=[512, 512, 512],  
-        activation_fn=torch.nn.ReLU,
-    ),
-    tensorboard_log=BASE_LOG_DIR,
-    verbose=1,
-    device=TARGET_DEVICE,
-    seed=SEED,
-)
+        policy="MlpPolicy",
+        env=env,
+        learning_rate=linear_schedule(3e-4),           
+        buffer_size=2_000_000,         
+        learning_starts=40000,        
+        batch_size=1024,               
+        tau=0.0005,
+        gamma=0.99,                    
+        train_freq=1,
+        gradient_steps=4,        
+        sde_sample_freq=64,            
+        ent_coef='auto_0.1',          
+        target_entropy=-4.0, # FIXED: -4.0 matches Meta-World action dim
+        policy_kwargs=dict(
+            net_arch=[512, 512, 512],  
+            activation_fn=torch.nn.ReLU,
+            optimizer_kwargs=dict(eps=5e-5)
+        ),
+        tensorboard_log=BASE_LOG_DIR,
+        verbose=1,
+        device=TARGET_DEVICE,
+        seed=SEED,
+    )
 
-    # Save checkpoint
     checkpoint_callback = CheckpointCallback(
         save_freq=CHECKPOINT_FREQ,
-        save_path=f"./metaworld_models/checkpoints_MT3/",
-        name_prefix=f"{ALGORITHM.lower()}_MT3",
+        save_path=f"./metaworld_models/checkpoints_MT3/{RUN_NAME}/",
+        name_prefix=f"sac_mt3",
         verbose=1
     )
 
-    # Evaluate
     eval_callback = EvalSuccessCallback(
         eval_env,
         best_model_save_path= f"./metaworld_models/{RUN_NAME}/best_model/",
@@ -156,9 +170,6 @@ if __name__ == "__main__":
         warn=False
     )
 
-    print("MT3 Task-Conditioned Wrapper initialized.")
-    print(f"Observation space: {env.observation_space.shape}") # Should be (42,)
-
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
         callback=[checkpoint_callback, eval_callback, success_callback],
@@ -167,30 +178,24 @@ if __name__ == "__main__":
         tb_log_name=RUN_NAME
     )
 
-    print("MT3 Task-Conditioned Wrapper learn success.")
-
-    # Save the final model (Same method as MT10)
     print("\nSaving final model...")
-    model.save(f"./metaworld_models/_MT3_final")
-
-    print("\n" + "=" * 60)
-    print("Training complete!")
-    print(f"Final model saved to: ./metaworld_models/_MT3_final.zip")
-    print(f"Best model saved to: ./metaworld_models/{RUN_NAME}/best_model/best_model.zip")
-    print(f"Checkpoints saved to: ./metaworld_models/checkpoints_MT3/")
-    print(f"\nTo monitor training, run: tensorboard --logdir=./metaworld_logs/MT3/")
-    print("=" * 60)
+    model.save(f"./metaworld_models/{RUN_NAME}_final")
+    # Save the normalization stats as well
+    env.save(f"./metaworld_models/{RUN_NAME}_vecnormalize.pkl")
 
     env.close()
 
+
     
+########## For cluster  
+
+
  # run this locally 
 
 #  ssh -L 6006:slurm-head-4:6006 e12434694@cluster.datalab.tuwien.ac.at
 
 
 # for slurm, run this on slurm  Need to activate environment first. # micromamba activate robotlearning
+ # python3 -m tensorboard.main --logdir="/home/e12434694/Robotlearning/Project/metaworld_logs/MT3" --port 6006 --bind_all
 
-   # python3 -m tensorboard.main --logdir="/home/e12434694/Robotlearning/Project/metaworld_logs/MT3" --port 6006 --bind_all
-
-    # then this http://localhost:6006 
+ # then this http://localhost:6006 
