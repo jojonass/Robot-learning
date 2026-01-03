@@ -96,7 +96,23 @@ def make_env(rank, seed=42):
 def linear_schedule(initial_value: float):
     def func(progress_remaining: float) -> float:
         return progress_remaining * initial_value
-    return func # FIXED: was returning 'function'
+    return func 
+
+def cosine_annealing(initial_value, total_steps, warmup_steps=2_000_000):
+    def func(progress_remaining):
+        current_step = (1 - progress_remaining) * total_steps
+        if current_step < warmup_steps:
+            return initial_value
+        
+        # Cosine decay for the remaining steps
+        remaining_steps = total_steps - warmup_steps
+        progress = (current_step - warmup_steps) / remaining_steps
+        return initial_value * 0.5 * (1 + np.cos(np.pi * progress))
+    return func
+
+
+
+
 
 if __name__ == "__main__":
     # --- SEED HANDLING ---
@@ -106,7 +122,7 @@ if __name__ == "__main__":
 
     # --- HYPERPARAMETERS ---
     NUM_ENV = 24
-    TOTAL_TIMESTEPS = 5_000_000
+    TOTAL_TIMESTEPS = 4_100_000
     ALGORITHM = "SAC"
     EVAL_FREQ = 20000 // NUM_ENV
     N_EVAL_EPISODES = 15 
@@ -129,17 +145,17 @@ if __name__ == "__main__":
     model = SAC(
         policy="MlpPolicy",
         env=env,
-        learning_rate=linear_schedule(3e-4),           
+        learning_rate=cosine_annealing(3e-4, TOTAL_TIMESTEPS ),         
         buffer_size=2_000_000,         
         learning_starts=40000,        
         batch_size=1024,               
         tau=0.0005,
         gamma=0.99,                    
         train_freq=1,
-        gradient_steps=4,        
-        sde_sample_freq=64,            
+        gradient_steps=2,        
+        #sde_sample_freq=64,            
         ent_coef='auto_0.1',          
-        target_entropy=-4.0, # FIXED: -4.0 matches Meta-World action dim
+        target_entropy=-4.0,
         policy_kwargs=dict(
             net_arch=[512, 512, 512],  
             activation_fn=torch.nn.ReLU,
