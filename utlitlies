@@ -1,91 +1,130 @@
+import os
+import sys
 import numpy as np
+import pandas as pd
 from collections import defaultdict
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from stable_baselines3.common.vec_env import VecNormalize
 
-class SuccessCallback(BaseCallback):
-    def __init__(self, log_freq=10000, verbose=0):
+# ==================== SELECTIVE NORMALIZER ====================
+class SelectiveVecNormalize(VecNormalize):
+    def __init__(self, venv, norm_dim=39, **kwargs):
+        super().__init__(venv, **kwargs)
+        self.norm_dim = norm_dim
+
+    def normalize_obs(self, obs: np.ndarray) -> np.ndarray:
+        if not self.norm_obs: return obs
+        if obs.ndim > 1:
+            obs_to_norm = obs[:, :self.norm_dim]
+            extra_part = obs[:, self.norm_dim:]
+            mean, var = self.obs_rms.mean[:self.norm_dim], self.obs_rms.var[:self.norm_dim]
+            normalized = np.clip((obs_to_norm - mean) / np.sqrt(var + self.epsilon), -self.clip_obs, self.clip_obs)
+            return np.concatenate([normalized, extra_part], axis=1).astype(np.float32)
+        else:
+            obs_to_norm = obs[:self.norm_dim]
+            extra_part = obs[self.norm_dim:]
+            mean, var = self.obs_rms.mean[:self.norm_dim], self.obs_rms.var[:self.norm_dim]
+            normalized = np.clip((obs_to_norm - mean) / np.sqrt(var + self.epsilon), -self.clip_obs, self.clip_obs)
+            return np.concatenate([normalized, extra_part]).astype(np.float32)
+
+# ==================== EVAL SUCCESS TRACKER ====================
+class EvalSuccessTracker(BaseCallback):
+    def __init__(self, task_list, seed=0, verbose=1):
         super().__init__(verbose)
-        self.log_freq = log_freq
-        self.task_successes = defaultdict(list)
-        self.env_current_success = defaultdict(float)
+        self.task_list = task_list
+        self.seed = seed
+        self.master_csv = os.path.abspath("combined_eval_success.csv")
+        print(f">>> DEBUG: Tracker Init for Seed {seed}", flush=True)
 
     def _on_step(self) -> bool:
-        infos = self.locals.get("infos")
-        dones = self.locals.get("dones")
-
-        if infos is None or dones is None:
-            return True
-
-        for i, info in enumerate(infos):
-            # Works for MT1/3/10 as long as 'success' is in info
-            if "success" in info:
-                self.env_current_success[i] = max(self.env_current_success[i], info["success"])
-
-        for i, done in enumerate(dones):
-            if done:
-                info = infos[i]
-                # Default to 'task' if task_name isn't provided (for simple MT1 setups)
-                task = info.get("task_name", "single_task")
-                self.task_successes[task].append(self.env_current_success[i])
-                self.env_current_success[i] = 0.0
-
-        if self.num_timesteps % self.log_freq == 0:
-            self._log_success_rates()
         return True
 
-    def _log_success_rates(self):
-        all_rates = []
-        for task, successes in self.task_successes.items():
-            if successes:
-                rate = np.mean(successes[-100:])
-                self.logger.record(f"success/{task}", rate)
-                all_rates.append(rate)
-        
-        # Only log a 'mean' if we are doing Multi-Task (MT3, MT10, etc.)
-        if len(all_rates) > 1:
-            self.logger.record("success/mean_combined", np.mean(all_rates))
-
-
-class EvalSuccessCallback(EvalCallback):
-    def _on_step(self) -> bool:
-        result = super()._on_step()
-        if self.n_calls % self.eval_freq == 0:
-            self._run_eval_success()
-        return result
-
-    def _run_eval_success(self):
+    def run_and_log_evaluation(self, eval_env, n_eval_episodes, step):
         task_success = defaultdict(list)
-        for _ in range(self.n_eval_episodes):
-            obs = self.eval_env.reset()
+        print(f"\n>>> Starting Custom Eval Loop at Step {step}...", flush=True)
+
+        for _ in range(n_eval_episodes):
+            obs = eval_env.reset()
             done = False
             last_info = {}
 
             while not done:
                 action, _ = self.model.predict(obs, deterministic=True)
-                obs, reward, done_array, info_array = self.eval_env.step(action)
+                obs, reward, done_array, info_array = eval_env.step(action)
 
                 done = done_array[0]
                 info = info_array[0]
                 last_info = info
 
                 if info.get("success", 0) > 0:
-                    task_name = info.get("task_name", "single_task")
+                    task_name = info.get("task_name", "unknown")
                     task_success[task_name].append(1.0)
                     done = True 
                     break
 
             if not last_info.get("success", 0) > 0:
-                task_name = last_info.get("task_name", "single_task")
+                task_name = last_info.get("task_name", "unknown")
                 task_success[task_name].append(0.0)
 
-        means = []
-        for task, values in task_success.items():
-            mean = np.mean(values)
-            self.logger.record(f"eval_success/{task}", mean)
-            means.append(mean)
+        # Calculate Results
+        task_means = {t: np.mean(task_success[t]) if t in task_success else 0.0 for t in self.task_list}
+        combined_mean = np.mean(list(task_means.values()))
 
-        # Log combined mean only for MT3/MT10
-        if len(means) > 1:
-            self.logger.record("eval_success/mean_combined", np.mean(means))
+        # 1. Print to SLURM and Logger
+        print(f"\n{'='*20} EVAL RESULTS (Step {step}) {'='*20}", flush=True)
+        for task, mean in task_means.items():
+            print(f"| {task:<15}: {mean:.4f}", flush=True)
+            if self.logger: self.logger.record(f"eval_success/{task}", mean)
+        
+        print(f"| COMBINED MEAN   : {combined_mean:.4f}", flush=True)
+        print(f"{'='*50}\n", flush=True)
+        
+        if self.logger:
+            self.logger.record("eval_success/mean_combined", combined_mean)
+            self.logger.dump(step)
 
-        self.logger.dump(self.num_timesteps)
+        # 2. Write to CSV with Individual Tasks
+        self._write_to_csv(step, combined_mean, task_means)
+
+    def _write_to_csv(self, step, combined_val, task_results):
+        try:
+            df = pd.read_csv(self.master_csv) if os.path.exists(self.master_csv) else pd.DataFrame(columns=['step'])
+            if step not in df['step'].values:
+                df = pd.concat([df, pd.DataFrame({'step': [step]})], ignore_index=True)
+            
+            # Save the combined mean for the seed
+            df.loc[df['step'] == step, f"seed_{self.seed}_mean"] = combined_val
+            
+            # Save individual task scores for this seed
+            for task_name, task_val in task_results.items():
+                col_name = f"seed_{self.seed}_{task_name}"
+                df.loc[df['step'] == step, col_name] = task_val
+            
+            df.sort_values("step").to_csv(self.master_csv, index=False)
+            print(f">>> DEBUG: CSV Updated (Tasks + Mean) at {self.master_csv}", flush=True)
+        except Exception as e:
+            print(f">>> CSV ERROR: {e}", flush=True)
+
+# ==================== CUSTOM EVAL CALLBACK ====================
+class EvalCallbackMT3(EvalCallback):
+    def __init__(self, *args, callback_after_eval=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tracker = callback_after_eval
+
+    def _on_step(self) -> bool:
+        continue_training = super()._on_step()
+        
+        if self.n_calls % self.eval_freq == 0:
+            if self.best_model_save_path is not None:
+                norm_save_path = os.path.join(self.best_model_save_path, "vecnormalize.pkl")
+                self.eval_env.save(norm_save_path)
+                print(f">>> DEBUG: Saved normalization stats to {norm_save_path}", flush=True)
+
+            if self.tracker is not None:
+                # Link model and logger (using _logger to bypass read-only property)
+                self.tracker.model = self.model
+                self.tracker._logger = self.logger
+                
+                self.tracker.run_and_log_evaluation(self.eval_env, self.n_eval_episodes, self.num_timesteps)
+        
+        return continue_training
