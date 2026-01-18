@@ -1,221 +1,182 @@
 import os
-os.environ["MUJOCO_GL"] = "egl"
 import torch
 import metaworld
 import random
 import numpy as np
 import gymnasium as gym
+import sys
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import CheckpointCallback
-from utlitlies import *
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.monitor import Monitor
 
+# Ensure your utility file is named exactly 'utlitlies.py' based on your import
+from utlitlies import * # ==================== CONFIGURATION ====================
+ALGO_NAME = "SAC"
+BENCHMARK_MODE = "MT10" # Changed from MT3 to MT10
+EXPERIMENT_BATCH_ID = os.environ.get("BATCH_ID", "default_batch")
 
-# ==================== DEVICE CONFIGURATION ====================
-print("=" * 60)
-if torch.cuda.is_available():
-    TARGET_DEVICE = "cuda"
-    #print(f" CUDA available! Training will run on: {torch.cuda.get_device_name(0)}")
-else:
-    TARGET_DEVICE = "cpu"
-    #warnings.warn(" CUDA not available. Training will default to CPU.", UserWarning)
-print("=" * 60)
+NUM_ENV = 40
+TOTAL_TIMESTEPS = 9_000_000
 
+# ==================== SCHEDULERS ====================
+def cosine_annealing(initial_value, total_steps=TOTAL_TIMESTEPS, warmup_steps=3_000_000):
+    def func(progress_remaining):
+        current_step = (1 - progress_remaining) * total_steps
+        if current_step < warmup_steps:
+            return initial_value
+        remaining_steps = total_steps - warmup_steps
+        progress = (current_step - warmup_steps) / remaining_steps
+        return initial_value * 0.5 * (1 + np.cos(np.pi * progress))
+    return func
 
+HYPERPARAMS = dict(
+    learning_rate=3e-4, 
+    buffer_size=2_000_000,
+    learning_starts=100_000,
+    batch_size=1024,
+    tau=0.0005,
+    gamma=0.99,
+    train_freq=1
+    gradient_steps=2,
+    ent_coef='auto_0.1',
+    target_entropy=-4.0,
+    policy_kwargs=dict(
+        net_arch=[768, 768, 768],
+        activation_fn=torch.nn.ReLU,
+        optimizer_kwargs=dict(eps=5e-5)
+    )
+)
+
+# ==================== ENVIRONMENT WRAPPER ====================
 class MT10Wrapper(gym.Env):
     def __init__(self):
         super().__init__()
-        self.benchmark = metaworld.MT10()
+        # Benchmarking MT10 instead of MT50
+        self.benchmark = metaworld.MT10() 
+        # Extract all 10 task names automatically
+        self.task_names = list(self.benchmark.train_classes.keys())
         self.all_tasks = self.benchmark.train_tasks
 
-        # 1. Map task names to IDs (0-9)
-        self.task_names = list(self.benchmark.train_classes.keys())
+        dummy_env = self.benchmark.train_classes[self.task_names[0]]()
+        self.base_obs_dim = dummy_env.observation_space.shape[0] # 39
+        obs_shape = self.base_obs_dim + len(self.task_names) # 39 + 10 = 49
 
-        # 2. Define spaces
-        # MT10 obs is 39-dim. We add 10-dim for One-Hot = 49-dim total.
-        dummy_env = self.benchmark.train_classes['reach-v3']()
-        obs_shape = dummy_env.observation_space.shape[0] + 10
-
-        self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_shape,), dtype=np.float32
-        )
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_shape,), dtype=np.float32)
         self.action_space = dummy_env.action_space
         self.active_env = None
-        self.current_task_idx = 0
-
-
 
     def _get_one_hot(self, task_idx):
-        one_hot = np.zeros(10, dtype=np.float32)
+        one_hot = np.zeros(len(self.task_names), dtype=np.float32)
         one_hot[task_idx] = 1.0
         return one_hot
 
     def reset(self, seed=None, options=None):
-        # Pick random task
+        super().reset(seed=seed)
         task = random.choice(self.all_tasks)
         self.current_task_idx = self.task_names.index(task.env_name)
-
-        # Create env for that specific task
         env_cls = self.benchmark.train_classes[task.env_name]
-        if self.active_env is None or self.active_env.__class__ != env_cls:
+        
+        if self.active_env is None or not isinstance(self.active_env, env_cls):
             self.active_env = env_cls()
-        self.active_env._freeze_rand_vec = False  # Ensure goal randomization
+            
+        self.active_env._freeze_rand_vec = False
         self.active_env.set_task(task)
-
-        # Reset and get base obs
-        raw_obs = self.active_env.reset(seed=seed)
-        if isinstance(raw_obs, tuple): raw_obs = raw_obs[0]  # Handle Gym API versions
-
-        # Append One-Hot Task ID
+        
+        raw_obs, info = self.active_env.reset(seed=seed)
+        info["task_name"] = self.task_names[self.current_task_idx]
+        
         full_obs = np.concatenate([raw_obs, self._get_one_hot(self.current_task_idx)])
-        return full_obs.astype(np.float32), {}
+        return full_obs.astype(np.float32), info
 
     def step(self, action):
-
         raw_obs, reward, terminated, truncated, info = self.active_env.step(action)
-        # Append One-Hot to step observation too!
+        task_name = self.task_names[self.current_task_idx]
+        info["task_name"] = task_name
+        
         full_obs = np.concatenate([raw_obs, self._get_one_hot(self.current_task_idx)])
-        info["task_name"] = self.task_names[self.current_task_idx]
+
+        # Reward Shaping
+        if info.get("success", 0) > 0:
+
+
+            if "push" in task_name: reward += 2000.0
+            elif "pick-place" in task_name: reward += 20_000.0
+            elif "peg-insert" in task_name: reward +=200_000.0
+            else reward += 200.0
+         
+        reward = np.log1p(reward)
+
         return full_obs.astype(np.float32), reward, terminated, truncated, info
 
-    def render(self):
-        return self.active_env.render()
-
-    def close(self):
-        if self.active_env is not None:
-            self.active_env.close()
-
-
-def make_env(rank, seed=42):
+def make_env(rank, seed):
     def _init():
-        # This keeps your logic identical
-        env = MT10Wrapper()
-        env = gym.wrappers.TimeLimit(env, max_episode_steps=500)
-        return env
-
-    set_random_seed(seed + rank)
+        set_random_seed(seed + rank)
+        return Monitor(gym.wrappers.TimeLimit(MT10Wrapper(), max_episode_steps=500))
     return _init
 
+# ==================== MAIN EXECUTION ====================#
 if __name__ == "__main__":
-
-    NUM_ENV = 40
-    SEED = 42
-    # Vectorized training env
-    env = SubprocVecEnv([make_env(i, SEED) for i in range(NUM_ENV)])
-    # Single eval env (wrapped in VecEnv for compatibility)
-    eval_env = SubprocVecEnv([make_env(99, SEED)])
-    success_callback = SuccessCallback(log_freq=10000)
-    # --- SETTINGS ---
-    TOTAL_TIMESTEPS = 5_000_000
-
-    ALGORITHM = "SAC"
-    # Evaluation Settings
-    EVAL_FREQ = 10000 // NUM_ENV # Adjusted for vectorization0  # Evaluate every N steps
-    N_EVAL_EPISODES = 20  # Number of episodes for evaluation
-    CHECKPOINT_FREQ = 25000  # Save checkpoint every N steps
-
-
-
-    # Create output directories
-    BASE_LOG_DIR = "./metaworld_logs/MT10"
-    RUN_NAME = f"seed{SEED}"  # Simplified for flat structure
+    slurm_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+    SEED = int(slurm_id) if slurm_id else 42
     
-    os.makedirs(BASE_LOG_DIR, exist_ok=True)
-    os.makedirs("./metaworld_models", exist_ok=True)
+    UNIQUE_RUN_ID = f"{ALGO_NAME}_{BENCHMARK_MODE}_seed{SEED}"
+    BASE_LOG_DIR = f"./metaworld_logs/{ALGO_NAME}_{BENCHMARK_MODE}_{EXPERIMENT_BATCH_ID}"
+    SEED_DIR = f"{BASE_LOG_DIR}/{UNIQUE_RUN_ID}" 
+    os.makedirs(SEED_DIR, exist_ok=True)
 
-    print(f"=" * 60)
-    print("Meta-World MT10 Training")
-    print(f"=" * 60)
+    # 1. Environments
+    env = SubprocVecEnv([make_env(i, SEED) for i in range(NUM_ENV)])
+    env = SelectiveVecNormalize(env, norm_dim=39, norm_obs=True, norm_reward=False)
+    
+    eval_env = SubprocVecEnv([make_env(99, SEED)])
+    eval_env = SelectiveVecNormalize(eval_env, norm_dim=39, norm_obs=True, training=False)
+    eval_env.obs_rms = env.obs_rms
 
+    # 2. Model
+    model = SAC(policy="MlpPolicy", env=env, tensorboard_log=BASE_LOG_DIR, verbose=1, **HYPERPARAMS)
 
-    RUN_NAME = f"MT10_seed{SEED}"
-    # SAC - Recommended for Meta-World (better exploration)#
-    model = SAC(
-        policy="MlpPolicy",
-        env=env,
-        learning_rate=3e-4,
-        buffer_size=2_000_000,
-        learning_starts=10000, 
-        batch_size=512,         # Increased batch size for more stable MT10 updates
-        tau=0.005,
-        gamma=0.99,
-        train_freq=1,
-        gradient_steps=NUM_ENV,     # Increased for faster learning
-        ent_coef='auto',
-        policy_kwargs=dict(
-            net_arch=[512, 512, 512], # Increased capacity for 10 tasks
-            activation_fn=torch.nn.ReLU,
-        ),
-        tensorboard_log=BASE_LOG_DIR,
-        verbose=1,
-        device="auto",
-        seed=SEED,
+    # 3. --- CALLBACKS SETUP ---
+    # Dynamically get the 10 task names for the tracker
+    dummy_wrapper = MT10Wrapper()
+    task_list = dummy_wrapper.task_names
+    
+    success_tracker = EvalSuccessTracker(
+        task_list=task_list, 
+        seed=SEED
     )
-   
+    
+    success_tracker.master_csv = os.path.abspath("combined_eval_success.csv")
 
-    # Save checkpoint every CHECKPOINT_FREQ steps
-    checkpoint_callback = CheckpointCallback(
-        save_freq=CHECKPOINT_FREQ,
-        save_path=f"./metaworld_models/checkpoints_MT10/",
-        name_prefix=f"{ALGORITHM.lower()}_MT10",
+    eval_callback = EvalCallbackMT3(
+        eval_env,
+        best_model_save_path=f"{SEED_DIR}/best_model/",
+        eval_freq=max(1, 20000 // NUM_ENV),
+        n_eval_episodes=20, # Increased slightly to cover 10 tasks better
+        callback_after_eval=success_tracker, 
         verbose=1
     )
 
-    # Evaluate every EVAL_FREQ steps
-    eval_callback =  EvalSuccessCallback(
-        eval_env,
-        best_model_save_path= f"./metaworld_models/{RUN_NAME}/best_model/",
-        log_path= f"{BASE_LOG_DIR}/{RUN_NAME}/eval/",
-        eval_freq=EVAL_FREQ,
-        n_eval_episodes=N_EVAL_EPISODES,  # More episodes for robust evaluation
-        deterministic=True,
-        render=False,
-        verbose=1,
-        warn=False
+    success_tracker.parent = eval_callback
+
+    checkpoint_callback = CheckpointCallback(
+        save_freq=max(1, 100000 // NUM_ENV),
+        save_path=f"{SEED_DIR}/checkpoints/",
+        name_prefix=UNIQUE_RUN_ID
     )
 
-    print("MT10 Task-Conditioned Wrapper initialized.")
-    print(f"Observation space: {env.observation_space.shape}")  # Should be (49,)
+    # 4. --- TRAINING ---
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
-        callback=[checkpoint_callback, eval_callback,success_callback],
-        log_interval=10,
-        progress_bar=True,
-        tb_log_name=RUN_NAME
+        callback=[checkpoint_callback, eval_callback], 
+        tb_log_name=UNIQUE_RUN_ID,
+        progress_bar=True
     )
-    print("MT10 Task-Conditioned Wrapper learn success.")
 
-    # Save the final model
-    print("\nSaving final model...")
-    model.save(f"./metaworld_models/_MT10_final")
-
-    print("\n" + "=" * 60)
-    print("Training complete!")
-    print(f"Final model saved to: ./metaworld_models/_MT10_final.zip")
-    print(f"Best model saved to: ./metaworld_models/best_MT10/best_model.zip")
-    print(f"Checkpoints saved to: ./metaworld_models/checkpoints_MT10/")
-    print(f"\nTo monitor training, run: tensorboard --logdir=./metaworld_logs/")
-    print("=" * 60)
-
-    # Cleanup
+    # 5. Final Save
+    model.save(f"{SEED_DIR}/{UNIQUE_RUN_ID}_final")
+    env.save(f"{SEED_DIR}/vecnormalize.pkl")
+    
     env.close()
-
-    # Locally run not on slurm
-
-    # to check tensorboard: tensorboard --logdir="C:\Users\josef\OneDrive\Desktop\Robot learning folder\Project\metaworld_logs"
-
-
-########## For cluster  
-
-
- # run this locally 
-
-#  ssh -L 6006:slurm-head-4:6006 e12434694@cluster.datalab.tuwien.ac.at
-
-
-# for slurm, run this on slurm  Need to activate environment first. # micromamba activate robotlearning
- # python3 -m tensorboard.main --logdir="/home/e12434694/Robotlearning/Project/metaworld_logs/MT10" --port 6006 --bind_all
-
-
- # then this http://localhost:6006 
+    eval_env.close()
