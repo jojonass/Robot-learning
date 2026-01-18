@@ -38,7 +38,7 @@ HYPERPARAMS = dict(
     batch_size=1024,
     tau=0.0005,
     gamma=0.99,
-    train_freq=1
+    train_freq=1,
     gradient_steps=2,
     ent_coef='auto_0.1',
     target_entropy=-4.0,
@@ -97,14 +97,14 @@ class MT10Wrapper(gym.Env):
         
         full_obs = np.concatenate([raw_obs, self._get_one_hot(self.current_task_idx)])
 
-        # Reward Shaping
+        # Reward Shaping (Kept identical to your MT3 logic)
         if info.get("success", 0) > 0:
 
 
             if "push" in task_name: reward += 2000.0
             elif "pick-place" in task_name: reward += 20_000.0
             elif "peg-insert" in task_name: reward +=200_000.0
-            else reward += 200.0
+            else: reward += 200.0
          
         reward = np.log1p(reward)
 
