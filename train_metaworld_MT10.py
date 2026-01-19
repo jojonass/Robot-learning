@@ -4,40 +4,35 @@ import metaworld
 import random
 import numpy as np
 import gymnasium as gym
-import sys
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.monitor import Monitor
-
-# Ensure your utility file is named exactly 'utlitlies.py' based on your import
 from utlitlies import * # ==================== CONFIGURATION ====================
 ALGO_NAME = "SAC"
-BENCHMARK_MODE = "MT10" # Changed from MT3 to MT10
-EXPERIMENT_BATCH_ID = os.environ.get("BATCH_ID", "default_batch")
+BENCHMARK_MODE = "MT10" 
+EXPERIMENT_BATCH_ID = os.environ.get("BATCH_ID", "MT10_custom_shaping")
 
 NUM_ENV = 40
-TOTAL_TIMESTEPS = 9_000_000
+TOTAL_TIMESTEPS = 9_000_000 
 
 # ==================== SCHEDULERS ====================
-def cosine_annealing(initial_value, total_steps=TOTAL_TIMESTEPS, warmup_steps=3_000_000):
+def cosine_annealing(initial_value, total_steps=TOTAL_TIMESTEPS, warmup_steps=7_000_000):
     def func(progress_remaining):
         current_step = (1 - progress_remaining) * total_steps
-        if current_step < warmup_steps:
-            return initial_value
-        remaining_steps = total_steps - warmup_steps
-        progress = (current_step - warmup_steps) / remaining_steps
+        if current_step < warmup_steps: return initial_value
+        progress = (current_step - warmup_steps) / (total_steps - warmup_steps)
         return initial_value * 0.5 * (1 + np.cos(np.pi * progress))
     return func
 
 HYPERPARAMS = dict(
-    learning_rate=3e-4, 
-    buffer_size=2_000_000,
-    learning_starts=100_000,
-    batch_size=1024,
+    learning_rate= 3e-4,  
+    buffer_size=1_000_000,
+    learning_starts=50_000,
+    batch_size= 1024,
     tau=0.0005,
-    gamma=0.99,
+    gamma=0.995,
     train_freq=1,
     gradient_steps=2,
     ent_coef='auto_0.1',
@@ -53,62 +48,65 @@ HYPERPARAMS = dict(
 class MT10Wrapper(gym.Env):
     def __init__(self):
         super().__init__()
-        # Benchmarking MT10 instead of MT50
-        self.benchmark = metaworld.MT10() 
-        # Extract all 10 task names automatically
+        self.benchmark = metaworld.MT10()
         self.task_names = list(self.benchmark.train_classes.keys())
-        self.all_tasks = self.benchmark.train_tasks
+        # Store tasks as a list to access by index
+        self.all_tasks = self.benchmark.train_tasks 
+        self.np_random = np.random.default_rng()
+        
+        # Pre-instantiate environments locally in each worker
+        self.envs = {name: cls() for name, cls in self.benchmark.train_classes.items()}
+        for e in self.envs.values():
+            e._freeze_rand_vec = False
 
-        dummy_env = self.benchmark.train_classes[self.task_names[0]]()
-        self.base_obs_dim = dummy_env.observation_space.shape[0] # 39
-        obs_shape = self.base_obs_dim + len(self.task_names) # 39 + 10 = 49
-
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_shape,), dtype=np.float32)
-        self.action_space = dummy_env.action_space
-        self.active_env = None
-
-    def _get_one_hot(self, task_idx):
-        one_hot = np.zeros(len(self.task_names), dtype=np.float32)
-        one_hot[task_idx] = 1.0
-        return one_hot
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(49,), dtype=np.float32)
+        self.action_space = self.envs[self.task_names[0]].action_space
 
     def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        task = random.choice(self.all_tasks)
-        self.current_task_idx = self.task_names.index(task.env_name)
-        env_cls = self.benchmark.train_classes[task.env_name]
+        # Handle seeding properly for reproducibility in Subproc
+        if seed is not None:
+            self.np_random = np.random.default_rng(seed)
         
-        if self.active_env is None or not isinstance(self.active_env, env_cls):
-            self.active_env = env_cls()
-            
-        self.active_env._freeze_rand_vec = False
-        self.active_env.set_task(task)
+        task_idx = self.np_random.integers(0, len(self.all_tasks))
+        task = self.all_tasks[task_idx]
         
-        raw_obs, info = self.active_env.reset(seed=seed)
-        info["task_name"] = self.task_names[self.current_task_idx]
+        self.active_name = task.env_name
+        self.current_task_idx = self.task_names.index(self.active_name)
         
-        full_obs = np.concatenate([raw_obs, self._get_one_hot(self.current_task_idx)])
-        return full_obs.astype(np.float32), info
+        env = self.envs[self.active_name]
+        env.set_task(task)
+        
+        raw_obs, info = env.reset(seed=seed)
+        info["task_name"] = self.active_name
+        
+        one_hot = np.zeros(10, dtype=np.float32)
+        one_hot[self.current_task_idx] = 1.0
+        return np.concatenate([raw_obs, one_hot]).astype(np.float32), info
 
     def step(self, action):
-        raw_obs, reward, terminated, truncated, info = self.active_env.step(action)
-        task_name = self.task_names[self.current_task_idx]
-        info["task_name"] = task_name
+        raw_obs, reward, terminated, truncated, info = self.envs[self.active_name].step(action)
+        info["task_name"] = self.active_name
         
-        full_obs = np.concatenate([raw_obs, self._get_one_hot(self.current_task_idx)])
-
-        # Reward Shaping (Kept identical to your MT3 logic)
+        # Apply your working Reward Shaping Logic for MT10
         if info.get("success", 0) > 0:
-
-
-            if "push" in task_name: reward += 2000.0
-            elif "pick-place" in task_name: reward += 20_000.0
-            elif "peg-insert" in task_name: reward +=200_000.0
-            else: reward += 200.0
+            name = self.active_name.lower()
+            if "push" in name:
+                reward += 2000.0
+            elif "pick-place" in name:
+                reward += 20_000.0
+            elif "peg-insert-side" in name:
+                reward += 200_000.0
+            else:
+                reward += 20.0
          
-        reward = np.log1p(reward)
-
-        return full_obs.astype(np.float32), reward, terminated, truncated, info
+    
+        reward = np.log1p(np.clip(reward, -0.99, None))
+        
+        one_hot = np.zeros(10, dtype=np.float32)
+        one_hot[self.current_task_idx] = 1.0
+        full_obs = np.concatenate([raw_obs, one_hot])
+        
+        return full_obs.astype(np.float32), float(reward), terminated, truncated, info
 
 def make_env(rank, seed):
     def _init():
@@ -116,7 +114,7 @@ def make_env(rank, seed):
         return Monitor(gym.wrappers.TimeLimit(MT10Wrapper(), max_episode_steps=500))
     return _init
 
-# ==================== MAIN EXECUTION ====================#
+# ==================== MAIN ====================
 if __name__ == "__main__":
     slurm_id = os.environ.get("SLURM_ARRAY_TASK_ID")
     SEED = int(slurm_id) if slurm_id else 42
@@ -126,47 +124,42 @@ if __name__ == "__main__":
     SEED_DIR = f"{BASE_LOG_DIR}/{UNIQUE_RUN_ID}" 
     os.makedirs(SEED_DIR, exist_ok=True)
 
-    # 1. Environments
+    # 1. Training Environment
     env = SubprocVecEnv([make_env(i, SEED) for i in range(NUM_ENV)])
     env = SelectiveVecNormalize(env, norm_dim=39, norm_obs=True, norm_reward=False)
     
+    # 2. Evaluation Environment
     eval_env = SubprocVecEnv([make_env(99, SEED)])
     eval_env = SelectiveVecNormalize(eval_env, norm_dim=39, norm_obs=True, training=False)
     eval_env.obs_rms = env.obs_rms
 
-    # 2. Model
+    # 3. Model
     model = SAC(policy="MlpPolicy", env=env, tensorboard_log=BASE_LOG_DIR, verbose=1, **HYPERPARAMS)
 
-    # 3. --- CALLBACKS SETUP ---
-    # Dynamically get the 10 task names for the tracker
-    dummy_wrapper = MT10Wrapper()
-    task_list = dummy_wrapper.task_names
+    # 4. Success Tracker & Callback
+    dummy_mt10 = metaworld.MT10()
+    mt10_tasks = list(dummy_mt10.train_classes.keys())
     
-    success_tracker = EvalSuccessTracker(
-        task_list=task_list, 
-        seed=SEED
-    )
-    
-    success_tracker.master_csv = os.path.abspath("combined_eval_success.csv")
+    success_tracker = EvalSuccessTracker(task_list=mt10_tasks, seed=SEED)
+    success_tracker.master_csv = os.path.abspath("combined_mt10_success.csv")
 
     eval_callback = EvalCallbackMT3(
         eval_env,
         best_model_save_path=f"{SEED_DIR}/best_model/",
-        eval_freq=max(1, 20000 // NUM_ENV),
-        n_eval_episodes=20, # Increased slightly to cover 10 tasks better
+        eval_freq=max(1, 40000 // NUM_ENV),
+        n_eval_episodes=50, # 5 per task
         callback_after_eval=success_tracker, 
         verbose=1
     )
-
     success_tracker.parent = eval_callback
 
     checkpoint_callback = CheckpointCallback(
-        save_freq=max(1, 100000 // NUM_ENV),
+        save_freq=max(1, 200000 // NUM_ENV),
         save_path=f"{SEED_DIR}/checkpoints/",
         name_prefix=UNIQUE_RUN_ID
     )
 
-    # 4. --- TRAINING ---
+    # 5. Training
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
         callback=[checkpoint_callback, eval_callback], 
@@ -174,9 +167,7 @@ if __name__ == "__main__":
         progress_bar=True
     )
 
-    # 5. Final Save
     model.save(f"{SEED_DIR}/{UNIQUE_RUN_ID}_final")
     env.save(f"{SEED_DIR}/vecnormalize.pkl")
-    
     env.close()
     eval_env.close()
