@@ -11,7 +11,7 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 
 # ==================== SETTINGS & HYPERPARAMS ==================== 
 ALGO_NAME = "SAC"
-TASK_NAME = 'push-v3'
+TASK_NAME = 'reach-v3'
 EXPERIMENT_BATCH_ID = os.environ.get("BATCH_ID", "debug")
 
 NUM_ENV = 8
