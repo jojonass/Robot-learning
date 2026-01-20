@@ -1,138 +1,190 @@
 import os
+os.environ["MUJOCO_GL"] = "egl"
+
 import gymnasium as gym
-from gymnasium.wrappers import RecordVideo
 import metaworld
 import numpy as np
-from stable_baselines3 import SAC
 
-# ==========================================
-# 1. DYNAMIC OBSERVATION WRAPPER
-# ==========================================
-class DynamicMTWrapper(gym.ObservationWrapper):
-    def __init__(self, env, task_index, total_tasks):
+from stable_baselines3 import SAC
+from gymnasium.wrappers import RecordVideo
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+# ============================================================
+# ======================== CONFIG ===========================
+# ============================================================
+
+# Map names to camera IDs
+CAMERAS = {
+    "default": 0,
+    "topview": 1,
+    "corner": 2,
+    "behindview": 3,
+}
+
+# Pick camera
+CAMERA = CAMERAS["topview"]  # choose topview / corner / behindview
+
+BENCHMARK = "MT3"             # MT1, MT3, MT10
+TASKS = ["reach-v3"]          # None = all tasks, or subset like ["reach-v3"]
+SEEDS = [1]                   # Seeds to evaluate
+MAX_STEPS = 500
+EXPERIMENT_NAME = "SAC_MT3_2"
+
+MODEL_ROOT = "/home/e12434694/Robotlearning/Project/metaworld_logs"
+VIDEO_ROOT = "./eval_videos"
+
+# ============================================================
+# ===================== CAMERA WRAPPER =======================
+# ============================================================
+
+class CameraWrapper(gym.Wrapper):
+    def __init__(self, env, camera_index=0):
         super().__init__(env)
-        self.task_index = task_index
-        self.total_tasks = total_tasks 
-        obs_shape = 39 + self.total_tasks
+        self.camera_index = camera_index
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        # set camera after reset
+        if hasattr(self.env.unwrapped, "mujoco_renderer"):
+            self.env.unwrapped.mujoco_renderer.camera_id = self.camera_index
+        return obs, info
+
+    def render(self, *args, **kwargs):
+        # forward all kwargs to avoid TypeError
+        return self.env.render(*args, **kwargs)
+
+    def set_task(self, task):
+        return self.env.set_task(task)
+
+# ============================================================
+# =================== ONE-HOT TASK WRAPPER ===================
+# ============================================================
+
+class OneHotTaskWrapper(gym.ObservationWrapper):
+    def __init__(self, env, task_idx, num_tasks):
+        super().__init__(env)
+        self.task_idx = task_idx
+        self.num_tasks = num_tasks
+        obs_dim = env.observation_space.shape[0] + num_tasks
         self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_shape,), dtype=np.float32
+            -np.inf, np.inf, shape=(obs_dim,), dtype=np.float32
         )
 
     def observation(self, obs):
-        if self.total_tasks == 0: return obs.astype(np.float32)
-        one_hot = np.zeros(self.total_tasks, dtype=np.float32)
-        one_hot[self.task_index] = 1.0
+        one_hot = np.zeros(self.num_tasks, dtype=np.float32)
+        one_hot[self.task_idx] = 1.0
         return np.concatenate([obs, one_hot]).astype(np.float32)
 
     def set_task(self, task):
         return self.env.set_task(task)
 
-    @property
-    def _freeze_rand_vec(self):
-        return self.env._freeze_rand_vec
+# ============================================================
+# ================== VECNORMALIZE LOADER =====================
+# ============================================================
 
-    @_freeze_rand_vec.setter
-    def _freeze_rand_vec(self, value):
-        self.env._freeze_rand_vec = value
+def load_vecnormalize(env, vecnorm_path):
+    env = VecNormalize.load(vecnorm_path, env)
+    env.training = False
+    env.norm_reward = False
+    return env
 
-# ==========================================
-# 2. CAMERA FIX WRAPPER (Universal Version)
-# ==========================================
-class MetaWorldCameraWrapper(gym.Wrapper):
-    def __init__(self, env, camera_name="topview"):
-        super().__init__(env)
-        self.camera_name = camera_name
-        
-        # Mapping common names to MuJoCo IDs if the name lookup fails
-        self.cam_map = {
-            'topview': 0,
-            'corner': 1,
-            'corner2': 2,
-            'corner3': 3,
-            'behindview': 4
-        }
+# ============================================================
+# ======================= MT1 RECORD ========================
+# ============================================================
 
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        # Set the name at the unwrapped level
-        self.env.unwrapped.camera_name = self.camera_name
-        return obs, info
+def record_mt1(seed, task_name):
+    print(f"🎥 MT1 | {task_name} | seed {seed}")
+    mt1 = metaworld.MT1(task_name, seed=seed)
+    env_cls = mt1.train_classes[task_name]
 
-    def render(self):
-        # We reach into the low-level MuJoCo renderer
-        # This forces the 'offscreen' camera used for recording
-        if hasattr(self.env.unwrapped, 'mujoco_renderer'):
-            renderer = self.env.unwrapped.mujoco_renderer
-            # Force the camera ID into the renderer's config
-            cam_id = self.cam_map.get(self.camera_name, 0)
-            renderer.camera_id = cam_id
-            renderer.camera_name = self.camera_name
-            
-        return self.env.render()
+    model_path = os.path.join(
+        MODEL_ROOT, "SAC_MT1", task_name, f"SAC_MT1_seed{seed}", "best_model", "best_model.zip"
+    )
+    model = SAC.load(model_path)
 
-    def set_task(self, task):
-        return self.env.set_task(task)
+    env = env_cls(render_mode="rgb_array")
+    env = CameraWrapper(env, CAMERA)
+    task = mt1.train_tasks[0]
+    env.set_task(task)
 
-    @property
-    def _freeze_rand_vec(self):
-        return self.env._freeze_rand_vec
+    video_dir = os.path.join(VIDEO_ROOT, "MT1", task_name, f"seed{seed}")
+    os.makedirs(video_dir, exist_ok=True)
+    env = RecordVideo(env, video_folder=video_dir, episode_trigger=lambda e: True, name_prefix=f"{task_name}_{CAMERA}")
 
-    @_freeze_rand_vec.setter
-    def _freeze_rand_vec(self, value):
-        self.env._freeze_rand_vec = value
+    obs, _ = env.reset()
+    for _ in range(MAX_STEPS):
+        action, _ = model.predict(obs, deterministic=True)
+        obs, _, done, truncated, _ = env.step(action)
+        if done or truncated:
+            break
+    env.close()
 
-# ==========================================
-# 3. MAIN EVALUATION FUNCTION
-# ==========================================
-def run_evaluation():
-    MODE = "MT10" 
-    CHOSEN_CAMERA = "topview" # Options: 'topview', 'corner2', 'behindview'
-    
-    MT3_TASKS = ['reach-v3', 'push-v3', 'pick-place-v3']
-    BASE_PATH = "/home/e12434694/Robotlearning/Project/metaworld_models"
-    VIDEO_DIR = "./eval_videos"
-    SEED = 42
+# ============================================================
+# ================= MT3 / MT10 RECORD =======================
+# ============================================================
 
-    benchmark = metaworld.MT10(seed=SEED)
-    num_one_hot = 10
-    model_folder = "best_MT10"
+def record_mt_multitask(seed):
+    print(f"\n🎥 {BENCHMARK} | seed {seed}")
 
-    model_path = os.path.join(BASE_PATH, model_folder, "best_model.zip")
-    print(f"🚀 Loading {MODE} model. Target Camera: {CHOSEN_CAMERA}")
+    if BENCHMARK == "MT3":
+        benchmark = metaworld.MT50(seed=seed)
+        task_names = ['reach-v3', 'push-v3', 'pick-place-v3']
+        tasks = [t for t in benchmark.train_tasks if t.env_name in task_names]
+        env_classes = {k: benchmark.train_classes[k] for k in task_names}
+    elif BENCHMARK == "MT10":
+        benchmark = metaworld.MT10(seed=seed)
+        tasks = benchmark.train_tasks
+        env_classes = benchmark.train_classes
+        task_names = list(env_classes.keys())
+    else:
+        raise ValueError("Invalid BENCHMARK")
 
-    for i, (name, env_cls) in enumerate(benchmark.train_classes.items()):
-        # Initialize
-        raw_env = env_cls(render_mode='rgb_array')
-        
-        # Stack Wrappers
-        mt_env = DynamicMTWrapper(raw_env, task_index=i, total_tasks=10)
-        cam_env = MetaWorldCameraWrapper(mt_env, camera_name="corner")   
-        
-        # Set Task
-        task_config = [t for t in benchmark.train_tasks if t.env_name == name][0]
-        cam_env.set_task(task_config)
+    base_seed_dir = os.path.join(MODEL_ROOT, EXPERIMENT_NAME, f"SAC_{BENCHMARK}_seed{seed}")
+    model_path = os.path.join(base_seed_dir, "best_model", "best_model.zip")
+    vecnorm_path = os.path.join(base_seed_dir, "best_model", "vecnormalize.pkl")
+    assert os.path.exists(model_path), f"Missing model: {model_path}"
+    assert os.path.exists(vecnorm_path), f"Missing VecNormalize: {vecnorm_path}"
 
-        # Record Video
-        env = RecordVideo(
-            cam_env, 
-            video_folder=os.path.join(VIDEO_DIR, name),
-            episode_trigger=lambda x: x == 0,
-            name_prefix=f"eval_fixed"
-        )
+    for task_idx, task_name in enumerate(task_names):
+        if TASKS and task_name not in TASKS:
+            continue
+        print(f"  ▶ Task: {task_name}")
 
-        if i == 0:
-            model = SAC.load(model_path, env=env)
+        env_cls = env_classes[task_name]
+        raw_env = env_cls(render_mode="rgb_array")
+        raw_env = OneHotTaskWrapper(raw_env, task_idx, len(task_names))
+        raw_env = CameraWrapper(raw_env, CAMERA)
 
-        # Execution
-        obs, _ = env.reset()
-        for _ in range(500): # Run one full episode (max_path_length is usually 500)
+        task = [t for t in tasks if t.env_name == task_name][0]
+        raw_env.set_task(task)
+
+        video_dir = os.path.join(VIDEO_ROOT, BENCHMARK, f"seed{seed}", task_name)
+        os.makedirs(video_dir, exist_ok=True)
+        raw_env = RecordVideo(raw_env, video_folder=video_dir, episode_trigger=lambda e: True, name_prefix=f"{task_name}_{CAMERA}")
+
+        env = DummyVecEnv([lambda: raw_env])
+        env = load_vecnormalize(env, vecnorm_path)
+        model = SAC.load(model_path, env=env)
+
+        obs = env.reset()
+        for _ in range(MAX_STEPS):
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, truncated, info = env.step(action)
-            if done or truncated:
+            obs, _, done, _ = env.step(action)
+            if done:
                 break
-        
-        print(f"Finished recording: {name}")
         env.close()
-        
+
+# ============================================================
+# =========================== MAIN ==========================
+# ============================================================
+
 if __name__ == "__main__":
-    run_evaluation()
+    for seed in SEEDS:
+        if BENCHMARK == "MT1":
+            assert TASKS is not None, "MT1 requires explicit TASKS"
+            for task in TASKS:
+                record_mt1(seed, task)
+        else:
+            record_mt_multitask(seed)
+
+    print("\n All videos recorded.")
