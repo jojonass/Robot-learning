@@ -15,7 +15,7 @@ TASK_NAME = 'reach-v3'
 EXPERIMENT_BATCH_ID = os.environ.get("BATCH_ID", "debug")
 
 NUM_ENV = 8
-TOTAL_TIMESTEPS = 2_500_000
+TOTAL_TIMESTEPS =330_000
 
 HYPERPARAMS = dict(
     learning_rate=3e-4,         
@@ -78,15 +78,9 @@ class SuccessFixer(gym.Wrapper):
 
         if info.get("success", 0) > 0 and self.was_successful == 0:
             self.was_successful = 1
-            reward += 0
-
-        # Reward shaping with log1p
-        # reward_clipped = np.clip(reward, -0.99, None)
-        #shaped_reward = np.log1p(reward_clipped)
-        shaped_reward = reward 
 
         info["is_success"] = self.was_successful
-        return obs, shaped_reward, terminated, truncated, info
+        return obs, reward, terminated, truncated, info
 
 # ==================== MAIN EXECUTION ====================
 if __name__ == "__main__":
