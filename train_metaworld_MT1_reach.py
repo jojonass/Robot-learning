@@ -30,7 +30,6 @@ HYPERPARAMS = dict(
     target_entropy=-4.0,
     policy_kwargs=dict(
         net_arch=[256, 256],  
-        log_std_init=-2.0, 
         activation_fn=torch.nn.ReLU
     )
 )
