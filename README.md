@@ -24,7 +24,7 @@ The training process generates CSV logs for every task and stability metric. Key
 * **`train_actor_loss` / `train_critic_loss`**: Training dynamics of the SAC networks.
 * **`eval_success_[task_name]-v3`**: Individual success rates for specific tasks like Peg-Insert, Window-Open, and Drawer-Close.
 
-## 🛠 Setup & Requirements
+##  Setup & Requirements
 
 ### Environment
 * **Python**: 3.10
