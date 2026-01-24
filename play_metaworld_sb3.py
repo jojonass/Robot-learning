@@ -16,19 +16,19 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 # Map names to camera IDs
 CAMERAS = {
     "default": 0,
-    "topview": 1,
+    "upside down": 1,
     "corner": 2,
-    "behindview": 3,
+    "topview": 3,
 }
 
 # Pick camera
-CAMERA = CAMERAS["topview"]  # choose topview / corner / behindview
+CAMERA = CAMERAS["default"]  # choose topview / corner / behindview
 
-BENCHMARK = "MT3"             # MT1, MT3, MT10
-TASKS = ["reach-v3"]          # None = all tasks, or subset like ["reach-v3"]
+BENCHMARK = "MT10"             # MT1, MT3, MT10
+TASKS = None         # None = all tasks, or subset like ["reach-v3"]
 SEEDS = [1]                   # Seeds to evaluate
 MAX_STEPS = 500
-EXPERIMENT_NAME = "SAC_MT3_2"
+EXPERIMENT_NAME = "SAC_MT10_2"
 
 MODEL_ROOT = "/home/e12434694/Robotlearning/Project/metaworld_logs"
 VIDEO_ROOT = "./eval_videos"
